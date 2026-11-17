@@ -16,7 +16,7 @@ const env = (name, fallback) => {
 const DRIVE_FOLDER_ID = env('DRIVE_FOLDER_ID');
 const GOOGLE_SERVICE_ACCOUNT_JSON = env('GOOGLE_SERVICE_ACCOUNT_JSON');
 const GEMINI_API_KEY = env('GEMINI_API_KEY');
-const GEMINI_MODEL = env('GEMINI_MODEL', 'gemini-2.5-flash');
+const GEMINI_MODEL = env('GEMINI_MODEL', 'gemini-3.8-flash');
 const UPLOADPOST_API_KEY = env('UPLOADPOST_API_KEY');
 const UPLOADPOST_PROFILE = env('UPLOADPOST_PROFILE', 'default');
 const PLATFORMS = env('PLATFORMS', 'tiktok,instagram,youtube').split(',').map((s) => s.trim()).filter(Boolean);
@@ -98,14 +98,32 @@ async function gerarLegendas(caminho, mimeType, nomeArquivo) {
   if (arquivo.state !== 'ACTIVE') throw new Error(`Gemini não processou o vídeo (estado: ${arquivo.state})`);
 
   try {
-    const res = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: [
-        createPartFromUri(arquivo.uri, arquivo.mimeType),
-        `${PROMPT}\n\nNome do arquivo (pode dar contexto): ${nomeArquivo}\nResponda só com o JSON.`,
-      ],
-      config: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.8 },
-    });
+    // tenta cada modelo da lista (GEMINI_MODEL separado por vírgula), com novas tentativas se o Gemini estiver sobrecarregado
+    const modelos = GEMINI_MODEL.split(',').map((m) => m.trim()).filter(Boolean);
+    let res, ultimoErro;
+    for (const modelo of modelos) {
+      for (let tentativa = 1; tentativa <= 4 && !res; tentativa++) {
+        try {
+          res = await ai.models.generateContent({
+            model: modelo,
+            contents: [
+              createPartFromUri(arquivo.uri, arquivo.mimeType),
+              `${PROMPT}\n\nNome do arquivo (pode dar contexto): ${nomeArquivo}\nResponda só com o JSON.`,
+            ],
+            config: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.8 },
+          });
+          log(`  legendas geradas com ${modelo}`);
+        } catch (e) {
+          ultimoErro = e;
+          const temporario = /\b(429|500|503)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(String(e?.message ?? e));
+          log(`  ${modelo} falhou (tentativa ${tentativa}): ${String(e?.message ?? e).slice(0, 150)}`);
+          if (!temporario) break; // erro definitivo: pula para o próximo modelo
+          await new Promise((r) => setTimeout(r, 15000 * tentativa));
+        }
+      }
+      if (res) break;
+    }
+    if (!res) throw ultimoErro;
     const l = JSON.parse(res.text);
     // limites das redes
     l.youtube_title = cortar(l.youtube_title, 100);
