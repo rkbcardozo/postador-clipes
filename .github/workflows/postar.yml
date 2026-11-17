@@ -1,0 +1,35 @@
+name: Postar clipes do Drive
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # a cada 15 minutos, todos os dias
+  workflow_dispatch:          # botão "Run workflow" para rodar na mão
+    inputs:
+      dry_run:
+        description: 'Só gerar legendas, sem enviar (teste)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: postar-clipes
+  cancel-in-progress: false
+
+jobs:
+  postar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm start
+        env:
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          UPLOADPOST_API_KEY: ${{ secrets.UPLOADPOST_API_KEY }}
+          UPLOADPOST_PROFILE: default
+          GEMINI_MODEL: gemini-2.5-flash
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
