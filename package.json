@@ -1,0 +1,17 @@
+{
+  "name": "postador-clipes",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pega clipes novos de uma pasta do Google Drive, gera legendas com Gemini e coloca na fila do Upload-Post (TikTok, Instagram, YouTube).",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "googleapis": "^144.0.0"
+  }
+}
