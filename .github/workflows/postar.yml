@@ -31,6 +31,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           UPLOADPOST_API_KEY: ${{ secrets.UPLOADPOST_API_KEY }}
           UPLOADPOST_PROFILE: default
-          GEMINI_MODEL: gemini-3.8-flash
+          GEMINI_MODEL: gemini-3.8-flash,gemini-3.5-flash-lite
           # MODO_TESTE (variável do repositório) = true -> nada é postado, só gera legendas
           DRY_RUN: ${{ (inputs.dry_run || vars.MODO_TESTE == 'true') && 'true' || 'false' }}
