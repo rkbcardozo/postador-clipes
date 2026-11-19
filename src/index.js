@@ -19,11 +19,15 @@ const GEMINI_API_KEY = env('GEMINI_API_KEY');
 const GEMINI_MODEL = env('GEMINI_MODEL', 'gemini-3.8-flash');
 const UPLOADPOST_API_KEY = env('UPLOADPOST_API_KEY');
 const UPLOADPOST_PROFILE = env('UPLOADPOST_PROFILE', 'default');
-const PLATFORMS = env('PLATFORMS', 'tiktok,instagram,youtube').split(',').map((s) => s.trim()).filter(Boolean);
+const PLATFORMS = env('PLATFORMS', 'tiktok,instagram,youtube')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const MAX_POR_EXECUCAO = Number(env('MAX_POR_EXECUCAO', '15'));
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
-const MARCA = 'uploadpost_status'; // appProperty gravada no arquivo do Drive depois de enviar
+const MARCA_STATUS = 'uploadpost_status';
+const MARCA_ENVIADAS = 'uploadpost_enviadas';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -37,7 +41,20 @@ function driveClient() {
   return google.drive({ version: 'v3', auth });
 }
 
-async function listarClipesNovos(drive) {
+function redesJaEnviadas(arquivo) {
+  const raw = arquivo.appProperties?.[MARCA_ENVIADAS] || '';
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function redesFaltantes(arquivo) {
+  const feitas = new Set(redesJaEnviadas(arquivo));
+  return PLATFORMS.filter((p) => !feitas.has(p));
+}
+
+async function listarClipesPendentes(drive) {
   const arquivos = [];
   let pageToken;
   do {
@@ -53,7 +70,13 @@ async function listarClipesNovos(drive) {
     arquivos.push(...(res.data.files ?? []));
     pageToken = res.data.nextPageToken;
   } while (pageToken);
-  return arquivos.filter((f) => !f.appProperties?.[MARCA]);
+
+  return arquivos.filter((f) => {
+    const faltantes = redesFaltantes(f);
+    if (!faltantes.length) return false;
+    if (!f.appProperties?.[MARCA_ENVIADAS] && f.appProperties?.[MARCA_STATUS]) return false;
+    return true;
+  });
 }
 
 async function baixar(drive, arquivo, destino) {
@@ -64,10 +87,30 @@ async function baixar(drive, arquivo, destino) {
   await pipeline(res.data, fs.createWriteStream(destino));
 }
 
-async function marcar(drive, arquivo, valor) {
+async function salvarProgresso(drive, arquivo, plataformasSucesso, pendentesLimite) {
+  const atual = new Set(redesJaEnviadas(arquivo));
+  for (const p of plataformasSucesso) atual.add(p);
+
+  const listaFeitas = [...atual].filter((p) => PLATFORMS.includes(p));
+  const restante = PLATFORMS.filter((p) => !atual.has(p));
+
+  let status;
+  if (!restante.length) {
+    status = `enviado ${new Date().toISOString()}`;
+  } else if (pendentesLimite.length) {
+    status = `aguardando_limite(${pendentesLimite.join(',')}) ${new Date().toISOString()}`;
+  } else {
+    status = `parcial(${restante.join(',')}) ${new Date().toISOString()}`;
+  }
+
   await drive.files.update({
     fileId: arquivo.id,
-    requestBody: { appProperties: { [MARCA]: valor } },
+    requestBody: {
+      appProperties: {
+        [MARCA_ENVIADAS]: listaFeitas.join(','),
+        [MARCA_STATUS]: status,
+      },
+    },
     supportsAllDrives: true,
   });
 }
@@ -75,7 +118,6 @@ async function marcar(drive, arquivo, valor) {
 // ---------- Gemini (legendas) ----------
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const PROMPT = fs.readFileSync(new URL('../prompt.md', import.meta.url), 'utf8');
-
 const SCHEMA = {
   type: Type.OBJECT,
   properties: {
@@ -90,15 +132,15 @@ const SCHEMA = {
 
 async function gerarLegendas(caminho, mimeType, nomeArquivo) {
   let arquivo = await ai.files.upload({ file: caminho, config: { mimeType } });
-  // espera o Gemini terminar de processar o vídeo
   for (let i = 0; i < 60 && arquivo.state === 'PROCESSING'; i++) {
     await new Promise((r) => setTimeout(r, 5000));
     arquivo = await ai.files.get({ name: arquivo.name });
   }
-  if (arquivo.state !== 'ACTIVE') throw new Error(`Gemini não processou o vídeo (estado: ${arquivo.state})`);
+  if (arquivo.state !== 'ACTIVE') {
+    throw new Error(`Gemini não processou o vídeo (estado: ${arquivo.state})`);
+  }
 
   try {
-    // tenta cada modelo da lista (GEMINI_MODEL separado por vírgula), com novas tentativas se o Gemini estiver sobrecarregado
     const modelos = GEMINI_MODEL.split(',').map((m) => m.trim()).filter(Boolean);
     let res, ultimoErro;
     for (const modelo of modelos) {
@@ -110,22 +152,28 @@ async function gerarLegendas(caminho, mimeType, nomeArquivo) {
               createPartFromUri(arquivo.uri, arquivo.mimeType),
               `${PROMPT}\n\nNome do arquivo (pode dar contexto): ${nomeArquivo}\nResponda só com o JSON.`,
             ],
-            config: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.8 },
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: SCHEMA,
+              temperature: 0.8,
+            },
           });
           log(`  legendas geradas com ${modelo}`);
         } catch (e) {
           ultimoErro = e;
-          const temporario = /\b(429|500|503)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(String(e?.message ?? e));
+          const temporario = /\b(429|500|503)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(
+            String(e?.message ?? e),
+          );
           log(`  ${modelo} falhou (tentativa ${tentativa}): ${String(e?.message ?? e).slice(0, 150)}`);
-          if (!temporario) break; // erro definitivo: pula para o próximo modelo
+          if (!temporario) break;
           await new Promise((r) => setTimeout(r, 15000 * tentativa));
         }
       }
       if (res) break;
     }
     if (!res) throw ultimoErro;
+
     const l = JSON.parse(res.text);
-    // limites das redes
     l.youtube_title = cortar(l.youtube_title, 100);
     l.tiktok_caption = cortar(l.tiktok_caption, 2200);
     l.instagram_caption = cortar(l.instagram_caption, 2200);
@@ -142,42 +190,57 @@ const cortar = (s, max) => {
 };
 
 // ---------- Upload-Post ----------
-async function colocarNaFila(caminho, arquivo, l) {
+function ehLimiteDePlataforma(err) {
+  return /\b429\b|daily posting cap|used_last_24h|Consider scheduling for later/i.test(
+    String(err?.message ?? err),
+  );
+}
+
+async function enviarParaPlataformas(caminho, arquivo, l, plataformasAlvo) {
   const form = new FormData();
   form.append('user', UPLOADPOST_PROFILE);
-  for (const p of PLATFORMS) form.append('platform[]', p);
+  for (const p of plataformasAlvo) form.append('platform[]', p);
+
   const blob = await fs.openAsBlob(caminho, { type: arquivo.mimeType || 'video/mp4' });
   form.append('video', blob, arquivo.name);
-
-  form.append('title', l.youtube_title); // obrigatório p/ YouTube; fallback geral
-  form.append('add_to_queue', 'true'); // vai para o próximo horário livre da fila
+  form.append('title', l.youtube_title);
+  form.append('add_to_queue', 'true');
   form.append('async_upload', 'true');
   form.append('external_id', arquivo.id);
 
-  // TikTok
-  form.append('tiktok_title', l.tiktok_caption);
-  form.append('privacy_level', 'PUBLIC_TO_EVERYONE');
-  // Instagram
-  form.append('instagram_title', l.instagram_caption);
-  form.append('media_type', 'REELS');
-  form.append('share_to_feed', 'true');
-  // YouTube
-  form.append('youtube_title', l.youtube_title);
-  form.append('youtube_description', l.youtube_description);
-  form.append('privacyStatus', 'public');
-  for (const t of l.youtube_tags ?? []) form.append('tags[]', t);
+  if (plataformasAlvo.includes('tiktok')) {
+    form.append('tiktok_title', l.tiktok_caption);
+    form.append('privacy_level', 'PUBLIC_TO_EVERYONE');
+  }
+  if (plataformasAlvo.includes('instagram')) {
+    form.append('instagram_title', l.instagram_caption);
+    form.append('media_type', 'REELS');
+    form.append('share_to_feed', 'true');
+  }
+  if (plataformasAlvo.includes('youtube')) {
+    form.append('youtube_title', l.youtube_title);
+    form.append('youtube_description', l.youtube_description);
+    form.append('privacyStatus', 'public');
+    for (const t of l.youtube_tags ?? []) form.append('tags[]', t);
+  }
 
+  const chaveSufixo = [...plataformasAlvo].sort().join('-');
   const res = await fetch('https://api.upload-post.com/api/upload', {
     method: 'POST',
     headers: {
       Authorization: `Apikey ${UPLOADPOST_API_KEY}`,
-      'Idempotency-Key': `drive-${arquivo.id}`, // evita post duplicado se rodar de novo
+      'Idempotency-Key': `drive-${arquivo.id}-${chaveSufixo}`,
     },
     body: form,
   });
+
   const corpo = await res.text();
   let json;
-  try { json = JSON.parse(corpo); } catch { json = { raw: corpo }; }
+  try {
+    json = JSON.parse(corpo);
+  } catch {
+    json = { raw: corpo };
+  }
   if (!res.ok || json.success === false) {
     throw new Error(`Upload-Post respondeu ${res.status}: ${corpo.slice(0, 500)}`);
   }
@@ -187,33 +250,78 @@ async function colocarNaFila(caminho, arquivo, l) {
 // ---------- Execução ----------
 async function main() {
   const drive = driveClient();
-  const novos = (await listarClipesNovos(drive)).slice(0, MAX_POR_EXECUCAO);
-  log(`Clipes novos encontrados: ${novos.length}`);
-  if (!novos.length) return;
+  const pendentes = (await listarClipesPendentes(drive)).slice(0, MAX_POR_EXECUCAO);
+  log(`Clipes pendentes encontrados: ${pendentes.length}`);
+  if (!pendentes.length) return;
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clipes-'));
-  let falhas = 0;
+  let falhasReais = 0;
 
-  for (const arquivo of novos) {
+  for (const arquivo of pendentes) {
     const caminho = path.join(tmp, arquivo.id + path.extname(arquivo.name || '.mp4'));
+    const alvos = redesFaltantes(arquivo);
+    const outrasRedes = alvos.filter((p) => p !== 'tiktok');
+    const temTiktok = alvos.includes('tiktok');
+
+    const enviadasNestaRodada = [];
+    const pendentesLimite = [];
+
     try {
-      log(`▶ ${arquivo.name}`);
+      log(`▶ ${arquivo.name} (alvos: ${alvos.join(', ')})`);
       await baixar(drive, arquivo, caminho);
       const l = await gerarLegendas(caminho, arquivo.mimeType || 'video/mp4', arquivo.name);
       log('  legendas:', JSON.stringify(l));
-      if (DRY_RUN) { log('  DRY_RUN ativo: não enviado'); continue; }
-      const r = await colocarNaFila(caminho, arquivo, l);
-      log('  na fila:', JSON.stringify(r));
-      await marcar(drive, arquivo, `enviado ${new Date().toISOString()}`);
+
+      if (DRY_RUN) {
+        log('  DRY_RUN ativo: não enviado');
+        continue;
+      }
+
+      if (outrasRedes.length) {
+        try {
+          const rOutras = await enviarParaPlataformas(caminho, arquivo, l, outrasRedes);
+          log(`  na fila (${outrasRedes.join(',')}):`, JSON.stringify(rOutras));
+          enviadasNestaRodada.push(...outrasRedes);
+        } catch (e) {
+          if (ehLimiteDePlataforma(e)) {
+            pendentesLimite.push(...outrasRedes);
+            log(`  ⏳ limite atingido em (${outrasRedes.join(',')}): fica para depois.`);
+          } else {
+            falhasReais++;
+            console.error(`  ✖ erro em ${arquivo.name} (${outrasRedes.join(',')}):`, e.message);
+          }
+        }
+      }
+
+      if (temTiktok) {
+        try {
+          const rTikTok = await enviarParaPlataformas(caminho, arquivo, l, ['tiktok']);
+          log('  na fila (tiktok):', JSON.stringify(rTikTok));
+          enviadasNestaRodada.push('tiktok');
+        } catch (e) {
+          if (ehLimiteDePlataforma(e)) {
+            pendentesLimite.push('tiktok');
+            log(`  ⏳ tiktok no limite de 24h em ${arquivo.name}; fica pendente para depois.`);
+          } else {
+            falhasReais++;
+            console.error(`  ✖ erro em ${arquivo.name} (tiktok):`, e.message);
+          }
+        }
+      }
+
+      if (enviadasNestaRodada.length || pendentesLimite.length) {
+        await salvarProgresso(drive, arquivo, enviadasNestaRodada, pendentesLimite);
+      }
     } catch (e) {
-      falhas++;
+      falhasReais++;
       console.error(`  ✖ erro em ${arquivo.name}:`, e.message);
     } finally {
       fs.rmSync(caminho, { force: true });
     }
   }
-  if (falhas) {
-    console.error(`${falhas} clipe(s) falharam; serão tentados de novo na próxima execução.`);
+
+  if (falhasReais) {
+    console.error(`${falhasReais} falha(s) real(is) ocorrida(s).`);
     process.exitCode = 1;
   }
 }
