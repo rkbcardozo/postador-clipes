@@ -277,7 +277,27 @@ async function main() {
         continue;
       }
 
-      if (outrasRedes.length) {
+      // 1) Tenta mandar TODAS as redes juntas: entram no MESMO horário da fila
+      let enviouJunto = false;
+      if (temTiktok && outrasRedes.length) {
+        try {
+          const rTodas = await enviarParaPlataformas(caminho, arquivo, l, alvos);
+          log(`  na fila juntos (${alvos.join(',')}):`, JSON.stringify(rTodas));
+          enviadasNestaRodada.push(...alvos);
+          enviouJunto = true;
+        } catch (e) {
+          if (ehLimiteDePlataforma(e)) {
+            log('  ⏳ limite em alguma rede: tentando separado...');
+          } else {
+            falhasReais++;
+            console.error(`  ✖ erro em ${arquivo.name} (${alvos.join(',')}):`, e.message);
+            continue;
+          }
+        }
+      }
+
+      // 2) Só se não deu junto (limite do TikTok), manda separado
+      if (!enviouJunto && outrasRedes.length) {
         try {
           const rOutras = await enviarParaPlataformas(caminho, arquivo, l, outrasRedes);
           log(`  na fila (${outrasRedes.join(',')}):`, JSON.stringify(rOutras));
@@ -293,7 +313,7 @@ async function main() {
         }
       }
 
-      if (temTiktok) {
+      if (!enviouJunto && temTiktok) {
         try {
           const rTikTok = await enviarParaPlataformas(caminho, arquivo, l, ['tiktok']);
           log('  na fila (tiktok):', JSON.stringify(rTikTok));
